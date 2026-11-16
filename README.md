@@ -24,7 +24,6 @@ This Chrome extension changes the favicon of a GitHub pull request page to indic
 
 ```
 my-extension/
-├── background.js
 ├── content.js
 ├── images/
 │   ├── approved_icon.png
