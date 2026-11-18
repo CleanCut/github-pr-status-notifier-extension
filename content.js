@@ -1,6 +1,6 @@
 let githubIcons = [];
 let snapshot = { key: null, status: null, at: 0 };
-let snapshotPromise = null;
+let snapshotFetching = false;
 
 function pullParts() {
   const match = location.pathname.match(/^\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
@@ -43,7 +43,7 @@ function headerState(root) {
   return null;
 }
 
-function reviewSignal(root) {
+function reviewApproved(root) {
   let approved = false;
   let changes = false;
   for (const icon of root.querySelectorAll(".reviewers-status-icon svg")) {
@@ -55,58 +55,52 @@ function reviewSignal(root) {
     if (text.endsWith("requested changes")) changes = true;
     else if (text.endsWith("approved these changes")) approved = true;
   }
-  if (changes) return "changes";
-  if (approved) return "approved";
-  return "none";
+  return approved && !changes;
 }
 
 function sidebarPresent() {
   return document.querySelector("#partial-discussion-sidebar, #pr-conversation-sidebar") !== null;
 }
 
-function displayedStatus() {
-  if (!pullParts()) return null;
+function displayedStatus(parts) {
   const state = headerState(document);
   if (state === "merged") return "merged";
   if (state === "closed") return null;
-  if (sidebarPresent()) return reviewSignal(document) === "approved" ? "approved" : null;
-  if ((state === "open" || state === "draft") && snapshot.key === pullParts().key) {
-    return snapshot.status;
-  }
-  return null;
+  if (sidebarPresent()) return reviewApproved(document) ? "approved" : null;
+  // A page with no reviewers sidebar gets the review status from a fetched copy of the sidebar.
+  if (state !== "open" && state !== "draft") return null;
+  refreshSnapshot(parts);
+  return snapshot.key === parts.key ? snapshot.status : null;
 }
 
-function refreshSnapshot() {
-  const parts = pullParts();
-  if (!parts || sidebarPresent()) return;
-  const state = headerState(document);
-  if (state === "merged" || state === "closed") return;
+function refreshSnapshot(parts) {
   if (snapshot.key === parts.key && Date.now() - snapshot.at < 30000) return;
-  if (snapshotPromise) return;
+  if (snapshotFetching) return;
 
   const url = new URL(
     `https://github.com/${parts.owner}/${parts.repo}/issues/${parts.number}/show_partial`
   );
   url.searchParams.set("partial", "pull_requests/sidebar/show/reviewers");
   const key = parts.key;
-  snapshotPromise = fetch(url, { credentials: "include" })
+  // A failed fetch keeps this pull request's last known status, and waits out the TTL to retry.
+  const keepStatus = () => {
+    snapshot = { key, status: snapshot.key === key ? snapshot.status : null, at: Date.now() };
+  };
+  snapshotFetching = true;
+  fetch(url, { credentials: "include" })
     .then((res) => (res.ok ? res.text() : null))
     .then((html) => {
       if (pullParts()?.key !== key) return;
-      if (!html) {
-        snapshot = { key, status: snapshot.key === key ? snapshot.status : null, at: Date.now() };
-        return;
-      }
+      if (!html) return keepStatus();
       const doc = new DOMParser().parseFromString(html, "text/html");
-      snapshot = { key, status: reviewSignal(doc) === "approved" ? "approved" : null, at: Date.now() };
+      snapshot = { key, status: reviewApproved(doc) ? "approved" : null, at: Date.now() };
       sync();
     })
     .catch(() => {
-      if (pullParts()?.key !== key) return;
-      snapshot = { key, status: snapshot.key === key ? snapshot.status : null, at: Date.now() };
+      if (pullParts()?.key === key) keepStatus();
     })
     .finally(() => {
-      snapshotPromise = null;
+      snapshotFetching = false;
     });
 }
 
@@ -157,8 +151,8 @@ function iconFor(status) {
 }
 
 function sync() {
-  refreshSnapshot();
-  const href = iconFor(displayedStatus());
+  const parts = pullParts();
+  const href = iconFor(parts ? displayedStatus(parts) : null);
   if (href) showExtensionIcon(href);
   else showGitHubIcon();
 }
