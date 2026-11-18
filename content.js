@@ -119,7 +119,7 @@ function iconLinks() {
 }
 
 function isExtensionIcon(href) {
-  return href.startsWith("chrome-extension://") || href.startsWith("moz-extension://");
+  return href.startsWith(chrome.runtime.getURL(""));
 }
 
 function rememberGitHubIcons() {
