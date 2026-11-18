@@ -128,13 +128,6 @@ function rememberGitHubIcons() {
   githubIcons = found.map((link) => link.cloneNode(true));
 }
 
-function iconsMatch(links, expected) {
-  return (
-    links.length === expected.length &&
-    links.every((link, i) => link.href === expected[i].href && link.rel === expected[i].rel)
-  );
-}
-
 function showExtensionIcon(href) {
   rememberGitHubIcons();
   const links = iconLinks();
@@ -149,9 +142,10 @@ function showExtensionIcon(href) {
 }
 
 function showGitHubIcon() {
-  if (githubIcons.length === 0) return;
   const links = iconLinks();
-  if (iconsMatch(links, githubIcons)) return;
+  // GitHub rewrites its icon links for CI status and dark mode, so leave them alone unless the
+  // extension's icon is showing.
+  if (githubIcons.length === 0 || !links.some((link) => isExtensionIcon(link.href))) return;
   links.forEach((link) => link.remove());
   githubIcons.forEach((link) => document.head.appendChild(link.cloneNode(true)));
 }
