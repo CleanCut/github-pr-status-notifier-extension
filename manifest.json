@@ -3,7 +3,6 @@
   "name": "GitHub PR Approved Notifier",
   "version": "1.1",
   "description": "Changes the tab icon when a GitHub pull request is approved or merged.",
-  "host_permissions": ["https://github.com/*"],
   "content_scripts": [
     {
       "matches": ["https://github.com/*"],

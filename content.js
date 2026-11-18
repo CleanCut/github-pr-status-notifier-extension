@@ -87,7 +87,7 @@ function refreshSnapshot(parts) {
     snapshot = { key, status: snapshot.key === key ? snapshot.status : null, at: Date.now() };
   };
   snapshotFetching = true;
-  fetch(url, { credentials: "include" })
+  fetch(url)
     .then((res) => (res.ok ? res.text() : null))
     .then((html) => {
       if (pullParts()?.key !== key) return;
