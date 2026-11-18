@@ -63,15 +63,17 @@ function sidebarPresent() {
 }
 
 // Returns a function that gives the value `load` last resolved to for a pull request (null before
-// the first), and starts a new load once that value is LOOKUP_TTL_MS old. A load that rejects
-// logs a warning, keeps the last value, and waits out the TTL to retry.
-function cachedLookup(load) {
+// the first), and starts a new load once that value is LOOKUP_TTL_MS old. Each new value goes to
+// `onLoad` with the time its load started. A load that rejects logs a warning, keeps the last
+// value, and waits out the TTL to retry.
+function cachedLookup(load, onLoad = () => {}) {
   let entry = { key: null, value: null, at: 0 };
   let loading = false;
   return (parts) => {
     const fresh = entry.key === parts.key && Date.now() - entry.at < LOOKUP_TTL_MS;
     if (!fresh && !loading) {
       const key = parts.key;
+      const startedAt = Date.now();
       const keepValue = () => {
         entry = { key, value: entry.key === key ? entry.value : null, at: Date.now() };
       };
@@ -80,6 +82,7 @@ function cachedLookup(load) {
         .then((value) => {
           if (pullParts()?.key !== key) return;
           entry = { key, value, at: Date.now() };
+          onLoad(value, startedAt);
           sync();
         })
         .catch((error) => {
@@ -155,11 +158,16 @@ async function newestCommitAt(parts) {
   );
 }
 
-// Resolves to the authors with feedback waiting, other than the viewer: whoever started each
-// unresolved review thread, then each human whose latest review requested changes or commented
-// with text after the newest commit.
-const feedbackAuthors = cachedLookup(async (parts) => {
+// Resolves to the pull request's review status:
+// - `authors`: those with feedback waiting, other than the viewer. That is whoever started each
+//   unresolved review thread, then each human whose latest visible review requested changes or
+//   commented with text after the newest commit.
+// - `settled`: whether each review thread is resolved, and each fetched conversation item hidden,
+//   keyed by type and ID.
+const reviewStatus = cachedLookup(async (parts) => {
   const [threads, since] = await Promise.all([allThreads(parts), newestCommitAt(parts)]);
+  const items = await conversationSince(parts, since);
+
   const authors = [];
   for (const thread of threads) {
     const first = thread.commentsData.comments[0];
@@ -168,16 +176,21 @@ const feedbackAuthors = cachedLookup(async (parts) => {
 
   // A review with no text and no verdict holds only thread comments, which the threads cover.
   const reviewers = new Set();
-  for (const item of await conversationSince(parts, since)) {
+  for (const item of items) {
     if (item.type !== "review_summary" || item.viewerDidAuthor || !isHuman(item.author)) continue;
-    if (item.state === "COMMENTED" && !item.body?.trim()) continue;
+    if (item.isHidden || (item.state === "COMMENTED" && !item.body?.trim())) continue;
     if (reviewers.has(item.author.login)) continue;
     reviewers.add(item.author.login);
     const waiting = item.state === "CHANGES_REQUESTED" || item.state === "COMMENTED";
     if (waiting && Date.parse(item.createdAt) > since) authors.push(item.author);
   }
-  return authors;
-});
+
+  const settled = new Map([
+    ...threads.map((thread) => [`thread:${thread.id}`, thread.isResolved]),
+    ...items.map((item) => [`${item.type}:${item.id}`, Boolean(item.isHidden)]),
+  ]);
+  return { authors, settled };
+}, noteReviewStatus);
 
 function isHuman(author) {
   return author?.userType === "human";
@@ -194,7 +207,7 @@ function displayedIcon(parts) {
   const sidebar = sidebarPresent();
   // Without the reviewers sidebar, only an open or draft header shows the pull request is open.
   if (!sidebar && state !== "open" && state !== "draft") return null;
-  const authors = feedbackAuthors(parts) ?? [];
+  const authors = reviewStatus(parts)?.authors ?? [];
   const human = authors.find((author) => isHuman(author) && author.avatarUrl);
   if (human) return new URL(human.avatarUrl, location.href).href;
   if (authors.length > 0) return extensionImage("feedback_icon.png");
@@ -242,9 +255,99 @@ function showGitHubIcon() {
   githubIcons.forEach((link) => document.head.appendChild(link.cloneNode(true)));
 }
 
+// GitHub's controls that resolve a review thread or hide a comment, which update the page in
+// place.
+const SETTLE_CONTROLS = [
+  '[data-dd-action-name="pull_requests.thread.resolve"]',
+  'button[aria-label^="Resolve conversation"]',
+  '[role="menuitem"][aria-label^="Hide comment as"]',
+].join(", ");
+
+// How long a use of a settle control in the page stands for a change a fetch has yet to see.
+const LOCAL_SETTLE_MS = 2 * LOOKUP_TTL_MS;
+
+// The review status the page shows: the first one fetched after it loaded or navigated to its
+// path, updated for each review thread resolved and comment hidden in the page itself
+// (`localSettles` holds when each was). `reload` is set once a later fetch finds one resolved or
+// hidden elsewhere.
+let shownPage = { path: null, since: 0, status: null, localSettles: [], reload: false };
+
+function noteNavigation() {
+  if (location.pathname === shownPage.path) return;
+  const since = shownPage.path === null ? performance.timeOrigin : Date.now();
+  shownPage = { path: location.pathname, since, status: null, localSettles: [], reload: false };
+}
+
+function noteSettleControl(event) {
+  if (event.type === "keydown" && event.key !== "Enter" && event.key !== " ") return;
+  if (event.target instanceof Element && event.target.closest(SETTLE_CONTROLS)) {
+    shownPage.localSettles.push(Date.now());
+  }
+}
+
+function noteReviewStatus(status, startedAt) {
+  if (startedAt < shownPage.since) return;
+  if (!shownPage.status) {
+    shownPage.status = status;
+    return;
+  }
+  const settled = newlySettled(shownPage.status, status);
+  if (settled === 0) return;
+  const local = shownPage.localSettles.filter((at) => Date.now() - at < LOCAL_SETTLE_MS);
+  if (settled > local.length) {
+    shownPage.reload = true;
+    return;
+  }
+  shownPage.status = status;
+  shownPage.localSettles = local.slice(settled);
+}
+
+// How many review threads `now` finds resolved, and conversation items hidden, that `shown` lists
+// as unresolved or visible.
+function newlySettled(shown, now) {
+  let count = 0;
+  for (const [key, settled] of now.settled) {
+    if (settled && shown.settled.get(key) === false) count++;
+  }
+  return count;
+}
+
+// Reloads the page once a review thread was resolved or an item hidden since it was shown, unless
+// a text box holds unsubmitted text, in which case a later call tries again.
+function reloadWhenSettled() {
+  noteNavigation();
+  rememberTextBoxDefaults();
+  if (shownPage.reload && !unsubmittedText()) location.reload();
+}
+
+// The text each text box held when first seen, ignoring whitespace. GitHub's React text areas
+// keep `defaultValue` equal to what was typed, so it can't serve as the unedited text.
+const textBoxDefaults = new WeakMap();
+
+function textBoxes() {
+  return document.querySelectorAll('textarea, [contenteditable]:not([contenteditable="false"])');
+}
+
+function textBoxText(box) {
+  return (box.tagName === "TEXTAREA" ? box.value : box.textContent).replace(/\s+/g, "");
+}
+
+function rememberTextBoxDefaults() {
+  for (const box of textBoxes()) {
+    if (!textBoxDefaults.has(box)) textBoxDefaults.set(box, textBoxText(box));
+  }
+}
+
+// Whether a text box holds text the user has typed and not submitted.
+function unsubmittedText() {
+  return [...textBoxes()].some((box) => textBoxText(box) !== textBoxDefaults.get(box));
+}
+
 function sync() {
   const parts = pullParts();
-  const href = parts ? displayedIcon(parts) : null;
+  if (!parts) return showGitHubIcon();
+  reloadWhenSettled();
+  const href = displayedIcon(parts);
   if (href) showExtensionIcon(href);
   else showGitHubIcon();
 }
@@ -254,6 +357,8 @@ function watch() {
     document.addEventListener(event, sync);
   }
   window.addEventListener("popstate", sync);
+  document.addEventListener("click", noteSettleControl, true);
+  document.addEventListener("keydown", noteSettleControl, true);
   if (window.navigation) window.navigation.addEventListener("navigatesuccess", sync);
   setInterval(sync, 1000);
   sync();
