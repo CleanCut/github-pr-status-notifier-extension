@@ -1,6 +1,6 @@
+const ICON_MARKER = "data-pr-status-notifier";
+const LOOKUP_TTL_MS = 30000;
 let githubIcons = [];
-let snapshot = { key: null, status: null, at: 0 };
-let snapshotFetching = false;
 
 function pullParts() {
   const match = location.pathname.match(/^\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
@@ -62,46 +62,144 @@ function sidebarPresent() {
   return document.querySelector("#partial-discussion-sidebar, #pr-conversation-sidebar") !== null;
 }
 
-function displayedStatus(parts) {
-  const state = headerState(document);
-  if (state === "merged") return "merged";
-  if (state === "closed") return null;
-  if (sidebarPresent()) return reviewApproved(document) ? "approved" : null;
-  // A page with no reviewers sidebar gets the review status from a fetched copy of the sidebar.
-  if (state !== "open" && state !== "draft") return null;
-  refreshSnapshot(parts);
-  return snapshot.key === parts.key ? snapshot.status : null;
+// Returns a function that gives the value `load` last resolved to for a pull request (null before
+// the first), and starts a new load once that value is LOOKUP_TTL_MS old. A load that rejects
+// logs a warning, keeps the last value, and waits out the TTL to retry.
+function cachedLookup(load) {
+  let entry = { key: null, value: null, at: 0 };
+  let loading = false;
+  return (parts) => {
+    const fresh = entry.key === parts.key && Date.now() - entry.at < LOOKUP_TTL_MS;
+    if (!fresh && !loading) {
+      const key = parts.key;
+      const keepValue = () => {
+        entry = { key, value: entry.key === key ? entry.value : null, at: Date.now() };
+      };
+      loading = true;
+      load(parts)
+        .then((value) => {
+          if (pullParts()?.key !== key) return;
+          entry = { key, value, at: Date.now() };
+          sync();
+        })
+        .catch((error) => {
+          console.warn("GitHub PR status notifier could not look up a pull request", error);
+          if (pullParts()?.key === key) keepValue();
+        })
+        .finally(() => {
+          loading = false;
+        });
+    }
+    return entry.key === parts.key ? entry.value : null;
+  };
 }
 
-function refreshSnapshot(parts) {
-  if (snapshot.key === parts.key && Date.now() - snapshot.at < 30000) return;
-  if (snapshotFetching) return;
-
-  const url = new URL(
-    `https://github.com/${parts.owner}/${parts.repo}/issues/${parts.number}/show_partial`
-  );
+const fetchedApproval = cachedLookup(async ({ owner, repo, number }) => {
+  const url = new URL(`https://github.com/${owner}/${repo}/issues/${number}/show_partial`);
   url.searchParams.set("partial", "pull_requests/sidebar/show/reviewers");
-  const key = parts.key;
-  // A failed fetch keeps this pull request's last known status, and waits out the TTL to retry.
-  const keepStatus = () => {
-    snapshot = { key, status: snapshot.key === key ? snapshot.status : null, at: Date.now() };
-  };
-  snapshotFetching = true;
-  fetch(url)
-    .then((res) => (res.ok ? res.text() : null))
-    .then((html) => {
-      if (pullParts()?.key !== key) return;
-      if (!html) return keepStatus();
-      const doc = new DOMParser().parseFromString(html, "text/html");
-      snapshot = { key, status: reviewApproved(doc) ? "approved" : null, at: Date.now() };
-      sync();
-    })
-    .catch(() => {
-      if (pullParts()?.key === key) keepStatus();
-    })
-    .finally(() => {
-      snapshotFetching = false;
-    });
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`GitHub responded ${res.status} to the reviewers sidebar`);
+  return reviewApproved(new DOMParser().parseFromString(await res.text(), "text/html"));
+});
+
+// Fetches the JSON GitHub's own pull request pages load, which needs the X-Requested-With header.
+async function pageData({ owner, repo, number }, path) {
+  const res = await fetch(`https://github.com/${owner}/${repo}/pull/${number}/${path}`, {
+    headers: { Accept: "application/json", "X-Requested-With": "XMLHttpRequest" },
+  });
+  if (!res.ok) throw new Error(`GitHub responded ${res.status} to ${path}`);
+  return res.json();
+}
+
+// The number of threads or conversation items GitHub returns per request.
+const PAGE_SIZE = 40;
+
+// Resolves to every review thread, fetching the pages after the first.
+async function allThreads(parts) {
+  const threads = [];
+  let page;
+  do {
+    const after = threads.length > 0 ? `?after=${threads.at(-1).id}` : "";
+    page = (await pageData(parts, `page_data/threads${after}`)).threads;
+    threads.push(...page);
+  } while (page.length >= PAGE_SIZE);
+  return threads;
+}
+
+// Resolves to the conversation's items newest first, down to the first one older than `since`.
+async function conversationSince(parts, since) {
+  const items = [];
+  let page;
+  do {
+    const oldest = items.at(-1);
+    const cursor = oldest && encodeURIComponent(conversationCursor(oldest));
+    const after = cursor ? `&after=${cursor}` : "";
+    page = (await pageData(parts, `page_data/conversation_comments?direction=desc${after}`)).items;
+    items.push(...page);
+  } while (page.length >= PAGE_SIZE && Date.parse(items.at(-1).createdAt) > since);
+  return items;
+}
+
+// The cursor GitHub's own page sends for the items older than `item`.
+function conversationCursor(item) {
+  const publishedAt = new Date(item.publishedAt).toISOString().replace(/\.\d+Z$/, ".000000Z");
+  return `${publishedAt}|${item.type}|${item.id}`;
+}
+
+async function newestCommitAt(parts) {
+  const commits = await pageData(parts, "commits");
+  return Math.max(
+    ...commits.payload.pullRequestsCommitsRoute.commitGroups
+      .flatMap((group) => group.commits)
+      .map((commit) => Date.parse(commit.committedDate))
+  );
+}
+
+// Resolves to the authors with feedback waiting, other than the viewer: whoever started each
+// unresolved review thread, then each human whose latest review requested changes or commented
+// with text after the newest commit.
+const feedbackAuthors = cachedLookup(async (parts) => {
+  const [threads, since] = await Promise.all([allThreads(parts), newestCommitAt(parts)]);
+  const authors = [];
+  for (const thread of threads) {
+    const first = thread.commentsData.comments[0];
+    if (!thread.isResolved && first && !first.viewerDidAuthor) authors.push(first.author);
+  }
+
+  // A review with no text and no verdict holds only thread comments, which the threads cover.
+  const reviewers = new Set();
+  for (const item of await conversationSince(parts, since)) {
+    if (item.type !== "review_summary" || item.viewerDidAuthor || !isHuman(item.author)) continue;
+    if (item.state === "COMMENTED" && !item.body?.trim()) continue;
+    if (reviewers.has(item.author.login)) continue;
+    reviewers.add(item.author.login);
+    const waiting = item.state === "CHANGES_REQUESTED" || item.state === "COMMENTED";
+    if (waiting && Date.parse(item.createdAt) > since) authors.push(item.author);
+  }
+  return authors;
+});
+
+function isHuman(author) {
+  return author?.userType === "human";
+}
+
+function extensionImage(name) {
+  return chrome.runtime.getURL(`images/${name}`);
+}
+
+function displayedIcon(parts) {
+  const state = headerState(document);
+  if (state === "merged") return extensionImage("merged_icon.png");
+  if (state === "closed") return null;
+  const sidebar = sidebarPresent();
+  // Without the reviewers sidebar, only an open or draft header shows the pull request is open.
+  if (!sidebar && state !== "open" && state !== "draft") return null;
+  const authors = feedbackAuthors(parts) ?? [];
+  const human = authors.find((author) => isHuman(author) && author.avatarUrl);
+  if (human) return new URL(human.avatarUrl, location.href).href;
+  if (authors.length > 0) return extensionImage("feedback_icon.png");
+  const approved = sidebar ? reviewApproved(document) : fetchedApproval(parts);
+  return approved ? extensionImage("approved_icon.png") : null;
 }
 
 function iconLinks() {
@@ -112,12 +210,12 @@ function iconLinks() {
   ];
 }
 
-function isExtensionIcon(href) {
-  return href.startsWith(chrome.runtime.getURL(""));
+function isExtensionIcon(link) {
+  return link.hasAttribute(ICON_MARKER);
 }
 
 function rememberGitHubIcons() {
-  const found = iconLinks().filter((link) => !isExtensionIcon(link.href));
+  const found = iconLinks().filter((link) => !isExtensionIcon(link));
   if (found.length === 0) return;
   githubIcons = found.map((link) => link.cloneNode(true));
 }
@@ -125,13 +223,13 @@ function rememberGitHubIcons() {
 function showExtensionIcon(href) {
   rememberGitHubIcons();
   const links = iconLinks();
-  if (links.length === 1 && links[0].rel === "icon" && links[0].href === href) return;
+  if (links.length === 1 && isExtensionIcon(links[0]) && links[0].href === href) return;
   // Leave either icon link in place and the tab can keep showing GitHub's.
   links.forEach((link) => link.remove());
   const link = document.createElement("link");
   link.rel = "icon";
-  link.type = "image/png";
   link.href = href;
+  link.setAttribute(ICON_MARKER, "");
   document.head.appendChild(link);
 }
 
@@ -139,20 +237,14 @@ function showGitHubIcon() {
   const links = iconLinks();
   // GitHub rewrites its icon links for CI status and dark mode, so leave them alone unless the
   // extension's icon is showing.
-  if (githubIcons.length === 0 || !links.some((link) => isExtensionIcon(link.href))) return;
+  if (githubIcons.length === 0 || !links.some(isExtensionIcon)) return;
   links.forEach((link) => link.remove());
   githubIcons.forEach((link) => document.head.appendChild(link.cloneNode(true)));
 }
 
-function iconFor(status) {
-  if (status === "approved") return chrome.runtime.getURL("images/approved_icon.png");
-  if (status === "merged") return chrome.runtime.getURL("images/merged_icon.png");
-  return null;
-}
-
 function sync() {
   const parts = pullParts();
-  const href = iconFor(parts ? displayedStatus(parts) : null);
+  const href = parts ? displayedIcon(parts) : null;
   if (href) showExtensionIcon(href);
   else showGitHubIcon();
 }
