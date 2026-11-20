@@ -3,13 +3,14 @@ const LOOKUP_TTL_MS = 30000;
 let githubIcons = [];
 
 function pullParts() {
-  const match = location.pathname.match(/^\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
+  const match = location.pathname.match(/^\/([^/]+)\/([^/]+)\/pull\/(\d+)(\/.*)?$/);
   if (!match || location.hostname !== "github.com") return null;
   return {
     owner: match[1],
     repo: match[2],
     number: match[3],
     key: `${match[1]}/${match[2]}#${match[3]}`,
+    conversation: !match[4] || match[4] === "/",
   };
 }
 
@@ -56,10 +57,6 @@ function reviewApproved(root) {
     else if (text.endsWith("approved these changes")) approved = true;
   }
   return approved && !changes;
-}
-
-function sidebarPresent() {
-  return document.querySelector("#partial-discussion-sidebar, #pr-conversation-sidebar") !== null;
 }
 
 // Returns a function that gives the value `load` last resolved to for a pull request (null before
@@ -164,6 +161,10 @@ async function newestCommitAt(parts) {
 //   commented with text after the newest commit.
 // - `settled`: whether each review thread is resolved, and each fetched conversation item hidden,
 //   keyed by type and ID.
+// - `verdicts`: when each fetched visible review by someone else that approved or requested
+//   changes was created, keyed by ID.
+// - `newestCommitAt`: when the newest commit was made. Every conversation item created after it
+//   is fetched.
 const reviewStatus = cachedLookup(async (parts) => {
   const [threads, since] = await Promise.all([allThreads(parts), newestCommitAt(parts)]);
   const items = await conversationSince(parts, since);
@@ -189,7 +190,15 @@ const reviewStatus = cachedLookup(async (parts) => {
     ...threads.map((thread) => [`thread:${thread.id}`, thread.isResolved]),
     ...items.map((item) => [`${item.type}:${item.id}`, Boolean(item.isHidden)]),
   ]);
-  return { authors, settled };
+
+  const verdicts = new Map();
+  for (const item of items) {
+    if (item.type !== "review_summary" || item.viewerDidAuthor || item.isHidden) continue;
+    if (item.state === "APPROVED" || item.state === "CHANGES_REQUESTED") {
+      verdicts.set(item.id, Date.parse(item.createdAt));
+    }
+  }
+  return { authors, settled, verdicts, newestCommitAt: since };
 }, noteReviewStatus);
 
 function isHuman(author) {
@@ -204,15 +213,12 @@ function displayedIcon(parts) {
   const state = headerState(document);
   if (state === "merged") return extensionImage("merged_icon.png");
   if (state === "closed") return null;
-  const sidebar = sidebarPresent();
-  // Without the reviewers sidebar, only an open or draft header shows the pull request is open.
-  if (!sidebar && state !== "open" && state !== "draft") return null;
+  if (state !== "open" && state !== "draft") return null;
   const authors = reviewStatus(parts)?.authors ?? [];
   const human = authors.find((author) => isHuman(author) && author.avatarUrl);
   if (human) return new URL(human.avatarUrl, location.href).href;
   if (authors.length > 0) return extensionImage("feedback_icon.png");
-  const approved = sidebar ? reviewApproved(document) : fetchedApproval(parts);
-  return approved ? extensionImage("approved_icon.png") : null;
+  return fetchedApproval(parts) ? extensionImage("approved_icon.png") : null;
 }
 
 function iconLinks() {
@@ -269,7 +275,8 @@ const LOCAL_SETTLE_MS = 2 * LOOKUP_TTL_MS;
 // The review status the page shows: the first one fetched after it loaded or navigated to its
 // path, updated for each review thread resolved and comment hidden in the page itself
 // (`localSettles` holds when each was). `reload` is set once a later fetch finds one resolved or
-// hidden elsewhere.
+// hidden elsewhere, or, on the Conversation tab, a new review by someone else that approved or
+// requested changes.
 let shownPage = { path: null, since: 0, status: null, localSettles: [], reload: false };
 
 function noteNavigation() {
@@ -289,6 +296,10 @@ function noteReviewStatus(status, startedAt) {
   if (startedAt < shownPage.since) return;
   if (!shownPage.status) {
     shownPage.status = status;
+    return;
+  }
+  if (pullParts()?.conversation && hasNewVerdict(shownPage.status, status)) {
+    shownPage.reload = true;
     return;
   }
   const settled = newlySettled(shownPage.status, status);
@@ -312,9 +323,18 @@ function newlySettled(shown, now) {
   return count;
 }
 
-// Reloads the page once a review thread was resolved or an item hidden since it was shown, unless
-// a text box holds unsubmitted text, in which case a later call tries again.
-function reloadWhenSettled() {
+// Whether `now` holds a verdict review that `shown` lacks and that was created after `shown`'s
+// newest commit, which `shown` would have fetched.
+function hasNewVerdict(shown, now) {
+  for (const [id, createdAt] of now.verdicts) {
+    if (createdAt > shown.newestCommitAt && !shown.verdicts.has(id)) return true;
+  }
+  return false;
+}
+
+// Reloads the page once a fetch sets `shownPage.reload`, unless a text box holds unsubmitted
+// text, in which case a later call tries again.
+function reloadWhenStale() {
   noteNavigation();
   rememberTextBoxDefaults();
   if (shownPage.reload && !unsubmittedText()) location.reload();
@@ -346,7 +366,7 @@ function unsubmittedText() {
 function sync() {
   const parts = pullParts();
   if (!parts) return showGitHubIcon();
-  reloadWhenSettled();
+  reloadWhenStale();
   const href = displayedIcon(parts);
   if (href) showExtensionIcon(href);
   else showGitHubIcon();
