@@ -11,7 +11,7 @@ This Chrome extension changes the favicon of a GitHub pull request page to indic
 - Detects when a pull request is approved and changes the favicon to indicate approval.
 - Detects when a pull request is merged and changes the favicon to indicate merging.
 - Shows when an open pull request has review feedback waiting, other than your own: an unresolved review thread (outdated ones included), or a human's latest review that requested changes or commented with text after the newest commit. The tab shows the avatar of a human with feedback waiting, or an orange speech bubble when only bots (such as CodeRabbit) have unresolved threads. Either one overrides the approved icon.
-- Reloads an open pull request's tab when one of its review threads is resolved, or one of its reviews or comments is hidden, somewhere other than that tab after the page loaded, since GitHub's page doesn't update for either. It also reloads the Conversation tab when someone else approves or requests changes, which GitHub's page doesn't show until reloaded either. It waits while any text box on the page holds text you haven't submitted.
+- Reloads an open pull request's tab when one of its review threads is resolved, or one of its reviews or comments is hidden, somewhere other than that tab after the page loaded, since GitHub's page doesn't update for either. It also reloads the Conversation tab when someone else approves or requests changes, which GitHub's page doesn't show until reloaded either, and reloads an open pull request's tab when GitHub's own icon still shows an outdated check status (pending after the checks finished, say) 30 seconds after they changed. It waits while any text box on the page holds text you haven't submitted.
 
 ## Installation
 

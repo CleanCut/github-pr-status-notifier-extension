@@ -209,10 +209,8 @@ function extensionImage(name) {
   return chrome.runtime.getURL(`images/${name}`);
 }
 
-function displayedIcon(parts) {
-  const state = headerState(document);
+function displayedIcon(parts, state) {
   if (state === "merged") return extensionImage("merged_icon.png");
-  if (state === "closed") return null;
   if (state !== "open" && state !== "draft") return null;
   const authors = reviewStatus(parts)?.authors ?? [];
   const human = authors.find((author) => isHuman(author) && author.avatarUrl);
@@ -261,6 +259,51 @@ function showGitHubIcon() {
   githubIcons.forEach((link) => document.head.appendChild(link.cloneNode(true)));
 }
 
+// The check status GitHub's icon shows for each state of the checks' rollup.
+const ROLLUP_ICON_STATUS = {
+  PASSED: "success",
+  PENDING: "pending",
+  PENDING_APPROVAL: "pending",
+  PENDING_FAILED: "failure",
+  FAILED: "failure",
+};
+
+// How long GitHub gets to update its own icon after a check changes state.
+const ICON_GRACE_MS = LOOKUP_TTL_MS;
+
+// Resolves to the state of the pull request's check rollup (null with no checks) and when a check
+// last changed state (0 with none).
+const checkStatus = cachedLookup(async (parts) => {
+  const data = await pageData(parts, "page_data/status_checks");
+  const changes = data.statusChecks.map((check) => Date.parse(check.stateChangedAt));
+  return {
+    rollup: data.statusRollup?.combinedState ?? null,
+    changedAt: Math.max(0, ...changes.filter(Number.isFinite)),
+  };
+});
+
+// The check status GitHub's icon shows, or null while it shows none.
+function githubIconStatus() {
+  const link = iconLinks().find((icon) => !isExtensionIcon(icon) && icon.type === "image/svg+xml");
+  if (!link) return null;
+  const match = new URL(link.href).pathname.match(
+    /\/favicon-(pending|success|failure|skipped)(?:-dark)?\.svg$/
+  );
+  return match?.[1] ?? null;
+}
+
+// Marks the page for a reload when GitHub's icon shows a check status other than the checks' own
+// ICON_GRACE_MS after they last changed state, unless that was before the page loaded.
+function noteStaleGitHubIcon(parts) {
+  const shown = githubIconStatus();
+  if (shown === null) return;
+  const checks = checkStatus(parts);
+  const expected = checks && ROLLUP_ICON_STATUS[checks.rollup];
+  if (!expected || expected === shown) return;
+  const loadedBeforeChange = checks.changedAt > performance.timeOrigin;
+  if (loadedBeforeChange && Date.now() - checks.changedAt > ICON_GRACE_MS) shownPage.reload = true;
+}
+
 // GitHub's controls that resolve a review thread or hide a comment, which update the page in
 // place.
 const SETTLE_CONTROLS = [
@@ -276,7 +319,7 @@ const LOCAL_SETTLE_MS = 2 * LOOKUP_TTL_MS;
 // path, updated for each review thread resolved and comment hidden in the page itself
 // (`localSettles` holds when each was). `reload` is set once a later fetch finds one resolved or
 // hidden elsewhere, or, on the Conversation tab, a new review by someone else that approved or
-// requested changes.
+// requested changes. `noteStaleGitHubIcon` also sets it.
 let shownPage = { path: null, since: 0, status: null, localSettles: [], reload: false };
 
 function noteNavigation() {
@@ -367,9 +410,11 @@ function sync() {
   const parts = pullParts();
   if (!parts) return showGitHubIcon();
   reloadWhenStale();
-  const href = displayedIcon(parts);
-  if (href) showExtensionIcon(href);
-  else showGitHubIcon();
+  const state = headerState(document);
+  const href = displayedIcon(parts, state);
+  if (href) return showExtensionIcon(href);
+  showGitHubIcon();
+  if (state === "open" || state === "draft") noteStaleGitHubIcon(parts);
 }
 
 function watch() {
